@@ -7,6 +7,7 @@ import numpy as np
 from keras.utils.vis_utils import plot_model
 import keras
 
+
 '''
 #######################################################################################
 def custom_loss1(y_true,y_pred):
@@ -235,7 +236,7 @@ def boxes_clip(boxes, window):
     return cliped
 
 # 分片处理
-def batch_slice(inputs,graph_fn,batch_size):
+def batch_slice(inputs,graph_fn,batch_size,names=None):
     if not isinstance(inputs):
         inputs = [inputs]
     out_puts = []
@@ -246,7 +247,12 @@ def batch_slice(inputs,graph_fn,batch_size):
             output_slice = [output_slice]
         out_puts.append(output_slice)
     out_puts = list(zip(*out_puts))
-    result = [tf.stack(o,axis=0) for o in out_puts]
+    if names is None:
+        result = [tf.stack(o, axis=0, name=n)
+              for o, n in zip(out_puts, names)]
+    else:
+        result = [tf.stack(o,axis=0) for o in out_puts]
+
     if len(result) == 1:
         result = result[0]
     return result
@@ -293,6 +299,76 @@ class proposal(KE.Layer):
         
     def compute_output_shape(self,input_shape):
         return (None,self.proposal_count,4)
+
+
+##########################################################################
+#
+#                          DetectionTarget
+#
+##########################################################################
+# 去除非0 的部分
+def trim_zeros_graph(boxes,name=None):
+    none_zero = tf.cast(tf.reduce_sum(tf.abs(boxes),axis=1),tf.bool)
+    boxes = tf.boolean_mask(boxes,none_zero,name=name)
+    return boxes,none_zero
+
+def overlaps_graph(boxes1, boxes2):
+    b1 = tf.reshape(tf.tile(tf.expand_dims(boxes1,1),[1,1,tf.shape(boxes2)[0]]),[-1,4])
+    b2 = tf.tile(boxes2,[tf.shape(boxes1)[0],1])
+
+    b1_y1,b1_x1,b1_y2,b1_x2 = tf.split(b1,4,axis=1)
+    b2_y1,b2_x1,b2_y2,b2_x2 = tf.split(b2,4,axis=1)
+
+    y1 = tf.maximun(b1_y1,b2_y1)
+    x1 = tf.maximun(b1_x1,b2_x1)
+    y2 = tf.minimun(b1_y2,b2_y2)
+    x2 = tf.minimun(b1_x1,b2_x1)
+
+    intersection = tf.maximun((y2-y1),0) * tf.maximun((x2-x1),0)
+    union = (b1_y2 - b1_y1) * (b1_x2 - b1_x1) + (b2_y2 - b2_y1)*(b2_x2 - b2_x1) - intersection
+    iou = intersection / union
+    overlaps = tf.reshape(iou, [tf.shape(boxes1)[0], tf.shape(boxes2)[0]])
+    return overlaps
+
+
+
+def detection_target_graph(proposals, gt_class_ids, gt_bboxes, config):
+    #去除非0 部分
+    proposals,_ = trim_zeros_graph(proposals,name='trim_proposals')
+    gt_bboxes,none_zeros = trim_zeros_graph(gt_bboxes,name='trim_bboxes')
+    gt_class_ids = tf.boolean_mask(gt_class_ids,none_zeros)
+
+    #计算每个proposals推荐的框预真值的iou
+    #取出最合适的推荐
+    #计算其对应的delta
+    overlaps = overlaps_graph(proposals, gt_bboxes)
+    max_iouArg = tf.reduce_max(overlaps,axis=1)
+    
+
+
+
+
+class DetectionTarget(KE.Layer):
+    def __init__(self,config,**kwargs):
+        super(DetectionTarget,self).__init__()
+        self.config = config
+    def call(self,inputs):
+        proposals = inputs[0]
+        gt_class_ids = inputs[1]
+        gt_bboxes = inputs[2]
+
+        names = ["rois", "target_class_ids", "target_deltas","target_bbox"]
+
+        outputs = batch_slice([proposals,gt_class_ids,gt_bboxes],
+                    lambda x,y,z:detection_target_graph(x,y,z,self.config),self.config.bash_size,names)
+
+        return outputs
+
+
+    def compute_output_shape(self,input_shape):
+        pass
+
+
 
 if __name__ == "__main__":
     ''' rest_net test
