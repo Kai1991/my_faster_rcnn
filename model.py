@@ -6,64 +6,8 @@ import tensorflow as tf
 import numpy as np 
 from keras.utils.vis_utils import plot_model
 import keras
+import utils
 
-
-'''
-#######################################################################################
-def custom_loss1(y_true,y_pred):
-    return K.mean(K.abs(y_true - y_pred))
-
-def custom_loss2(y_true,y_pred):
-    return K.mean(K.square(y_true - y_pred))
-
-
-
-input_tensor1 = KL.Input((32,32,3))
-input_tensor2 = KL.Input((4,))
-target = KL.Input((2,))
-
-x = KL.BatchNormalization(axis=-1)(input_tensor1)
-x = KL.Conv2d(16,(3,3),padding='same') (x)
-x= KL.Activation("relu")(x)
-x = KL.MaxPool2D(2)(x)
-x = KL.Conv2D(32,(3,3),padding='same')(x)
-x = KL.Activation('relu')(x)
-x = KL.MaxPool2D(2)(x)
-x = KL.Flatten()(x)
-x = KL.Dense(32)(x)
-out2  = KL.Dense(2)(x)
-
-
-y = KL.Dense(32)(input_tensor2)
-out1 = KL.Dense(2)(y)
-
-loss1 = KL.Lambda(lambda x:custom_loss1(*x),name='loss1')([out2,out1])
-
-loss2 = KL.Lambda(lambda x:custom_loss1(*x),name='loss2')([target,out2])
-
-model = Model([input_tensor1,input_tensor2,target],[out1,out2,loss1])
-
-model.summary()
-
-#training
-
-loss_lay1 = model.get_layer("loss1").output
-loss_lay2 = model.get_layer("loss2").output
-
-model.add_loss(loss_lay1)
-model.add_loss(loss_lay2)
-
-model.compile(optimizer='sgd',loss=[None,None,None,None])
-
-
-def data_gen(num):
-    for i in range(num):
-        yield [np.random.normal(1,1,(1,32,32,3)),np.random.normal(1,1,(1,4)),np.random.normal(1,1,(1,2))],[]
-
-data_set = data_gen(100000)
-model.fit_generate(data_set,step_per_epoch=100,epochs=20)
-############################################################################################
-'''
 
 ##########################################################################
 #
@@ -330,7 +274,27 @@ def overlaps_graph(boxes1, boxes2):
     overlaps = tf.reshape(iou, [tf.shape(boxes1)[0], tf.shape(boxes2)[0]])
     return overlaps
 
+def box_refinement_graph(boxes, gt_box):
+    boxes = tf.cast(boxes,tf.float32)
+    gt_box = tf.cast(gt_box,tf.float32)
 
+    height = boxes[2] - boxes[0]
+    weight = boxes[3] - boxes[1]
+    center_y = boxes[0] + height/2
+    center_x = boxes[1] + weight/2
+
+    gt_height = gt_box[2] - gt_box[0]
+    gt_weight = gt_box[3] - gt_box[1]
+    gt_center_y = gt_box[0] + gt_box/2
+    gt_center_x = gt_box[1] + gt_box/2
+
+    dy = (gt_height - center_y)/height
+    dx = (gt_weight - center_x)/weight
+    dh = tf.log(gt_height/height)
+    dw = tf.log(gt_weight/weight)
+
+    deltas = tf.stack([dy,dx,dh,dw],axis=1)
+    return deltas
 
 def detection_target_graph(proposals, gt_class_ids, gt_bboxes, config):
     #去除非0 部分
@@ -338,15 +302,52 @@ def detection_target_graph(proposals, gt_class_ids, gt_bboxes, config):
     gt_bboxes,none_zeros = trim_zeros_graph(gt_bboxes,name='trim_bboxes')
     gt_class_ids = tf.boolean_mask(gt_class_ids,none_zeros)
 
-    #计算每个proposals推荐的框预真值的iou
-    #取出最合适的推荐
-    #计算其对应的delta
-    overlaps = overlaps_graph(proposals, gt_bboxes)
-    max_iouArg = tf.reduce_max(overlaps,axis=1)
+    #计算每个proposal和每个gt_bboxes的iou 
+    #加入有N个proposal 和 M个 gt_bboxes
+    overlaps = overlaps_graph(proposals, gt_bboxes) #返回的shape：[N,M]
+    max_iouArg = tf.reduce_max(overlaps,axis=1) # 沿着M压缩 取出N个最大值  用来判断哪个proposal 是前景
+    max_iouGT = tf.argmax(overlaps,axis=0)# 沿着N压缩  计算出proposal 对应最适应的gt_bboxes
+
+    positive_mask = max_iouArg > 0.5 #大于0.5的为前景
+    positive_idxs = tf.where(positive_mask)[:,0] # 前景索引
+    negative_idxs = tf.where(max_iouArg <= 0.5)[:,0] # 背景索引
+
+
+    num_positive = int(config.num_proposals_train *  config.num_proposals_ratio) #前景的数量
+    positive_idxs = tf.random_shuffle(positive_idxs)[:num_positive]
+    positive_idxs = tf.concat([positive_idxs, max_iouGT], axis=0)
+    positive_idxs = tf.unique(positive_idxs)[0] # 前景索引
     
+    num_positive = tf.shape(positive_idxs)[0] #前景的数量
 
+    r = 1 / config.num_proposals_ratio
+    num_negative = tf.cast(r * tf.cast(num_positive, tf.float32), tf.int32) - num_positive #背景的数量
+    negative_idxs = tf.random_shuffle(negative_idxs)[:num_negative]#背景索引
 
+    positive_rois = tf.gather(proposals,positive_idxs)
+    negative_rois = tf.gather(proposals,negative_idxs)
 
+    # 取出前景对应的gt_bbox
+    positive_overlap = tf.gather(overlaps,positive_idxs)
+    gt_assignment = tf.argmax(positive_overlap,axis=1)
+    gt_bboxes = tf.gather(positive_overlap,gt_assignment)
+    gt_class_ids = tf.gather(gt_class_ids,gt_assignment)
+
+    # 计算偏移量
+    deltas = box_refinement_graph(positive_rois, gt_bboxes)
+    deltas /= config.RPN_BBOX_STD_DEV # 算出来的太小，需要统一增大
+
+    rois = tf.concat([positive_rois, negative_rois], axis=0)
+
+    N = tf.shape(negative_rois)[0]
+    P = config.num_proposals_train - tf.shape(rois)[0]
+    
+    rois = tf.pad(rois,[(0,P),(0,0)])
+    gt_class_ids = tf.pad(gt_class_ids, [(0, N+P)])
+    deltas = tf.pad(deltas,[(0,N+P),(0,0)])
+    gt_bboxes = tf.pad(gt_bboxes,[(0,N+P),(0,0)])
+    
+    return rois, gt_class_ids, deltas, gt_bboxes
 
 class DetectionTarget(KE.Layer):
     def __init__(self,config,**kwargs):
@@ -368,6 +369,281 @@ class DetectionTarget(KE.Layer):
     def compute_output_shape(self,input_shape):
         pass
 
+
+
+##########################################################################
+#
+#                          utils
+#
+##########################################################################
+class BatchNorm(KL.BatchNormalization):
+    def call(self, inputs, training=None):
+        return super(self.__class__, self).call(inputs, training=False)
+
+
+
+##########################################################################
+#
+#                          fpn_classifiler
+#
+##########################################################################
+
+def roi_pooling_onebacth(img, rois, num_rois, pool_size, nb_channels):
+    img = K.expand_dims(img, 0)
+    outputs = []
+    for roi_idx in range(num_rois):
+
+        y1 = rois[roi_idx, 0]
+        x1 = rois[roi_idx, 1]
+        y2 = rois[roi_idx, 2]
+        x2 = rois[roi_idx, 3]
+
+        x2 = x1 + K.maximum(1.0,x2-x1)
+        y2 = y1 + K.maximum(1.0,y2-y1)
+
+        y1 = K.cast(y1, 'int32')
+        x1 = K.cast(x1, 'int32')
+        y2 = K.cast(y2, 'int32')
+        x2 = K.cast(x2, 'int32')
+
+        rs = tf.image.resize_images(img[:, y1:y2, x1:x2, :], (pool_size, pool_size))
+        outputs.append(rs)
+
+    final_output = K.concatenate(outputs, axis=0)
+    final_output = K.reshape(final_output, (-1, num_rois, pool_size, pool_size, nb_channels))
+    return final_output
+
+class RoiPoolingConvV2(KE.Layer):
+    def __init__(self,pool_size,num_rois,batch_size,**kwargs):
+        self.dim_ordering = K.image_dim_ordering()
+        assert self.dim_ordering in {'tf', 'th'}, 'dim_ordering must be in {tf, th}'
+
+        self.pool_size = pool_size
+        self.num_rois = num_rois
+        self.batch_size = batch_size
+
+        super(RoiPoolingConvV2,self).__init__(**kwargs)
+
+    def build(self,input_shape):
+        if self.dim_ordering() == 'th':
+            self.nb_channels = input_shape[0][1]
+        if self.dim_ordering() == 'tf':
+            self.nb_channels = input_shape[0][3]
+    
+    def compute_output_shape(self,input_shape):
+        if self.dim_ordering == 'th':
+            return None, self.num_rois, self.nb_channels, self.pool_size, self.pool_size
+        else:
+            return None, self.num_rois, self.pool_size, self.pool_size, self.nb_channels
+
+    def call(self,x,mask=None):
+        assert(len(x) == 2)
+
+        img = x[0]
+        rois = [1]
+
+        out = batch_slice([img,rois],lambda x,y: roi_pooling_onebacth(x,y,self.num_rois, self.pool_size, self.nb_channels), \
+                                batch_size=self.batch_size)
+        out = K.reshape(out, (-1, self.num_rois, self.pool_size, self.pool_size, self.nb_channels))
+        return out
+
+    def get_config(self):
+        config = {'pool_size': self.pool_size,
+                  'num_rois': self.num_rois}
+        base_config = super(RoiPoolingConv, self).get_config()
+        return dict(list(base_config.items()) + list(config.items())) 
+  
+
+def fpn_classifiler(feature_map, rois, batch_size, num_rois, pool_size, num_classes):
+    x = RoiPoolingConvV2(7,num_rois,batch_size)([feature_map,rois])
+    x = KL.TimeDistributed(KL.Conv2D(512,pool_size,padding='valid'),name="mrcnn_class_conv1")(x)
+    x = KL.TimeDistributed(BatchNorm(axis=3),name="fpn_classifier_bn0")(x)
+    x = KL.Activation('relu')(x)
+
+    x = KL.TimeDistributed(KL.Conv2D(512, (1, 1), padding="valid"), name="fpn_classifier_conv1")(x)
+    x = KL.TimeDistributed(BatchNorm(axis=3), name="fpn_classifier_bn1")(x)
+    x = KL.Activation("relu")(x)
+
+    base = KL.Lambda(lambda x: K.squeeze(K.squeeze(x, 3), 2),name="fpn_classifier_squeeze")(x)
+
+    #分类
+    class_logits = KL.TimeDistributed(KL.Dense(num_classes),name='fpn_classifier_logits')(base)
+    class_prob = KL.TimeDistributed(KL.Activation('softmax'),name="fpn_classifier_prob")(class_logits)
+
+    #回归
+    class_fc = KL.TimeDistributed(KL.Dense(4*num_classes,activation='linear'),name="fpn_classifier_fc")(base)
+    s = K.int_shape(class_fc)
+    class_bbox = KL.Reshape((s[1],num_classes,4), name="fpn_class_deltas")(class_fc)
+
+    return class_logits,class_prob,class_bbox
+
+##########################################################################
+#
+#                          fpn_loss
+#
+##########################################################################
+def smooth_l1_loss(y_true,y_pred):
+    diff = tf.abs(y_true-y_pred)
+    less_than_one = K.cast(tf.less(diff,1.0),'float32')
+    loss = (less_than_one * 0.5 * diff**2) + (1-less_than_one)(diff - 0.5)
+    return loss
+
+
+def mrcnn_bbox_loss_graph(target_bbox, target_class_ids, pred_bbox):
+    target_class_ids =K.reshape(target_class_ids,(-1,))
+    target_bbox = K.reshape(target_bbox,(-1,4))
+    pred_bbox = K.reshape(pred_bbox,(-1,K.int_shape(pred_bbox)[2],4)) #?
+
+    positive_roi_ix = tf.where(target_class_ids > 0)[:,0]
+    positive_roi_class_ids = K.cast(tf.gather(target_class_ids,positive_roi_ix),tf.int32)
+
+    indices = tf.stack([positive_roi_ix, positive_roi_class_ids], axis=1)#?
+
+    target_bbox = tf.gather(target_bbox, positive_roi_ix)
+    pred_bbox = tf.gather_nd(pred_bbox, indices) #?
+
+    loss = K.switch(tf.size(target_bbox) > 0,
+                    smooth_l1_loss(y_true=target_bbox, y_pred=pred_bbox),
+                    tf.constant(0.0))
+    loss = K.mean(loss)
+    loss = K.reshape(loss, [1, 1])
+    return loss
+
+def mrcnn_class_loss_graphV2(target_class_ids, pred_class_logits,active_class_ids, batch_size=20):
+    target_class_ids = tf.cast(target_class_ids, 'int64')
+    pred_class_ids = tf.argmax(pred_class_logits,axis=2)
+
+    pred_active = batch_slice([active_class_ids, pred_class_ids],lambda x,y:tf.gather(x,y),batch_size=batch_size)#?
+
+    loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
+        labels=target_class_ids, logits=pred_class_logits)
+
+    pred_active = tf.cast(pred_active, tf.float32)
+
+    loss = loss * pred_active
+
+
+    loss = tf.reduce_sum(loss) / tf.reduce_sum(pred_active)
+    return loss
+                
+
+
+
+##########################################################################
+#
+#                          faster_rcnn
+#
+##########################################################################
+
+class FasterRcnn():
+    def __init__(self,mode,subnet,config):
+        assert mode in ["training","inference"]
+
+        self.mode = mode
+        self.subnet = subnet
+        self.config = config
+        self.keras_model = self.build(self.mode,self.subnet,self.config)
+    
+    def build(self,mode,sub_net,config):
+        assert mode in ["training","inference"]
+
+        h, w = config.image_size[: 2]
+        #模型输入
+        input_image = KL.Input(shape=[h,w,3],dtype=tf.float32)
+        input_bboxes = KL.Input(shape=[None,4],dtype=tf.float32)
+        input_class_ids = KL.Input(shape=[None],dtype=tf.int32)
+        input_active_ids = KL.Input(shape=[4,], dtype=tf.int32) #?
+        input_rpn_match = KL.Input(shape=[None,1],dtype=tf.int32)
+        input_rpn_box = KL.Input(shape=[None,4],dtype=tf.float32)
+
+        #归一化gt_bboxes
+        imgae_scale = K.cast(tf.stack([h,w,h,w]),tf.float32)
+        gt_bboxes = KL.Lambda(lambda x : x/imgae_scale)(input_bboxes)
+
+        feature_map = resnet_feature_extractor(input_image) # 特征提取
+        rpn_class,rpn_prob,rpn_bbox = rpn_net(feature_map,9) # rpn 推荐 # todo
+
+        #获取anchors 
+        anchors = utils.anchor_gen(featureMap_size=[8,8],ratios=config.ratios, #todo
+                                scales=config.scales,rpn_stride=config.rpn_stride,anchor_stride=config.anchor_stride)
+
+        proposals = proposal(config.proposal_count,nms_thresh=0.7,anchors,batch_size=config.batch_size)([rpn_prob,rpn_bbox])
+
+        if mode == 'training':
+            target_rois, target_class_ids, target_delta, target_bboxes = DetectionTarget(config,name="proposal_target")([proposals,input_class_ids,gt_bboxes])
+
+            denomrlaize_rois = KL.Lambda(lambda x: 8.0*x,name="denormalized_rois")(target_rois) #把roi放在特征图的维度上
+
+            #过分类和回归
+            mrcnn_class_logits, mrcnn_class, mrcnn_bbox = fpn_classifiler(feature_map, denomrlaize_rois, 20, 21, 7, 4)
+
+            #rpn_loss
+            loss_rpn_match = KL.Lambda(lambda x:rpn_class_loss(*x),name='loss_rpn_match')([input_rpn_match,rpn_prob])
+            loss_rpn_bbox = KL.Lambda(lambda x:rpn_bbox_loss(*x),name='loss_rpn_bbox')([input_rpn_box,rpn_bbox])
+            #floss 
+            bbox_loss = KL.Lambda(lambda x: mrcnn_bbox_loss_graph(*x), name="bbox_loss")(
+                                                [target_delta, target_class_ids, mrcnn_bbox])
+            class_loss = KL.Lambda(lambda x: mrcnn_class_loss_graphV2(*x), name="mrcnn_class_loss")(
+                                        [target_class_ids, mrcnn_class_logits, input_active_ids])
+
+            if sub_net == 'rpn':
+                model = Model([input_image,input_bboxes,input_class_ids,input_active_ids,input_rpn_match,input_rpn_box],[feature_map, rpn_class, rpn_prob, rpn_bbox, proposals, target_rois, denomrlaize_rois,target_class_ids,target_delta, target_bboxes, loss_rpn_match, loss_rpn_bbox])
+            elif sub_net == 'all':
+                model = Model([input_image,input_bboxes,input_class_ids,input_active_ids,input_rpn_match,input_rpn_box],[feature_map, rpn_class, rpn_prob, rpn_bbox, proposals, target_rois, denomrlaize_rois,target_class_ids, target_delta, target_bboxes, mrcnn_class_logits, mrcnn_class, mrcnn_bbox, loss_rpn_match, loss_rpn_bbox, bbox_loss, class_loss])
+            
+        if mode == "inference":
+            denomrlaize_proposals = KL.Lambda(lambda x:8.0*x, name="denormalized_proposals")(proposals)
+            mrcnn_class_logits, mrcnn_class, mrcnn_bbox = fpn_classifiler(feature_map, denomrlaize_proposals, 20, 16, 7, 4)
+            detections = DetectionLayer()([proposals, mrcnn_class, mrcnn_bbox])
+            
+            model = Model([input_image],[detections])
+
+        return model
+    
+    def compile_(self):
+        loss_lay1 = self.keras_model.get_layer("loss_rpn_match").output
+        loss_lay2 = self.keras_model.get_layer("loss_rpn_bbox").output
+        if self.subnet == "all":
+            loss_lay3 = self.keras_model.get_layer("bbox_loss").output
+            loss_lay4 = self.keras_model.get_layer("mrcnn_class_loss").output
+
+        self.keras_model.add_loss(tf.reduce_mean(loss_lay1))
+        self.keras_model.add_loss(tf.reduce_mean(loss_lay2))
+        if self.subnet == "all":
+            self.keras_model.add_loss(tf.reduce_mean(loss_lay3))
+            self.keras_model.add_loss(tf.reduce_mean(loss_lay4))
+
+        self.keras_model.compile(loss=[None]*len(self.keras_model.output), optimizer=keras.optimizers.SGD(lr=0.00005, momentum=0.9))
+
+        self.keras_model.metrics_names.append("loss_rpn_match")
+        self.keras_model.metrics_tensors.append(tf.reduce_mean(loss_lay1, keep_dims=True))
+
+        self.keras_model.metrics_names.append("loss_rpn_bbox")
+        self.keras_model.metrics_tensors.append(tf.reduce_mean(loss_lay2, keep_dims=True))
+
+        if self.subnet == "all":
+            self.keras_model.metrics_names.append("bbox_loss")
+            self.keras_model.metrics_tensors.append(tf.reduce_mean(loss_lay3, keep_dims=True))
+
+            self.keras_model.metrics_names.append("mrcnn_class_loss")
+            self.keras_model.metrics_tensors.append(tf.reduce_mean(loss_lay4, keep_dims=True))
+
+    def training(self,trainGen):
+        self.compile_()
+        self.keras_model.fit_generator(trainGen,steps_per_epoch=20, epochs=100) #todo
+
+    def inference(self,testData):
+        assert self.mode == "inference"
+        out = self.keras_model.predict(testData)
+        return out
+
+    def saveWeights(self,weights_path):
+        self.keras_model.save_weights(weights_path)
+
+    def loadWeights(self,weights_path):
+        self.keras_model.load_weights(weights_path)
+
+    
 
 
 if __name__ == "__main__":
@@ -410,7 +686,7 @@ if __name__ == "__main__":
     model.summary()
     plot_model(model,to_file="model_rpn_loss.jpg")
     '''
-    ''' train'''
+    ''' train
     input_image = KL.Input(shape=[64,64,3], dtype=tf.float32)
     input_bboxes = KL.Input(shape=[None,4], dtype=tf.float32)
     input_class_ids = KL.Input(shape=[None],dtype=tf.int32)
@@ -477,9 +753,10 @@ if __name__ == "__main__":
     #训练
     his = model.fit_generator(dataGen,steps_per_epoch=20, epochs=1200)
     model.save_weights("model_material.h5")
-
-    '''todo proposal 测试
     '''
+
+    ''' faster-rcnn 测试'''
+    model = fasterRCNN(mode="training", subnet="all", config=config)
 
 
 
