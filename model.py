@@ -567,7 +567,7 @@ class FasterRcnn():
         anchors = utils.anchor_gen(featureMap_size=[8,8],ratios=config.ratios, #todo
                                 scales=config.scales,rpn_stride=config.rpn_stride,anchor_stride=config.anchor_stride)
 
-        proposals = proposal(config.proposal_count,nms_thresh=0.7,anchors,batch_size=config.batch_size)([rpn_prob,rpn_bbox])
+        proposals = proposal(config.proposal_count,nms_thresh=0.7,anchros=anchors,batch_size=config.batch_size)([rpn_prob,rpn_bbox])
 
         if mode == 'training':
             target_rois, target_class_ids, target_delta, target_bboxes = DetectionTarget(config,name="proposal_target")([proposals,input_class_ids,gt_bboxes])
@@ -756,7 +756,46 @@ if __name__ == "__main__":
     '''
 
     ''' faster-rcnn 测试'''
+    from utils import shapeData as dataSet
+    from config import Config
+    config = Config()
+    dataset = dataSet([64,64], config=config)
+
     model = fasterRCNN(mode="training", subnet="all", config=config)
+
+    def data_Gen(dataset, num_batch, batch_size, config):
+        for _ in range(num_batch):
+            images = []
+            bboxes = []
+            class_ids = []
+            rpn_matchs = []
+            rpn_bboxes = []
+            active_ids = []
+            for i in range(batch_size):
+                image, bbox, class_id, active_id, rpn_match, rpn_bbox, _ = data = dataset.load_data()
+                pad_num = config.max_gt_obj - bbox.shape[0]
+                pad_box = np.zeros((pad_num, 4))
+                pad_ids = np.zeros((pad_num, 1))
+                bbox = np.concatenate([bbox, pad_box], axis=0)
+                class_id = np.concatenate([class_id, pad_ids], axis=0)
+
+                images.append(image)
+                bboxes.append(bbox)
+                class_ids.append(class_id)
+                rpn_matchs.append(rpn_match)
+                rpn_bboxes.append(rpn_bbox)
+                active_ids.append(active_id)
+            images = np.concatenate(images, 0).reshape(batch_size, config.image_size[0],config.image_size[1] , 3)
+            bboxes = np.concatenate(bboxes, 0).reshape(batch_size, -1 , 4)
+            class_ids = np.concatenate(class_ids, 0).reshape(batch_size, -1 )
+            active_ids = np.concatenate(active_ids, 0).reshape(batch_size, -1 )
+            rpn_matchs = np.concatenate(rpn_matchs, 0).reshape(batch_size, -1 , 1)
+            rpn_bboxes = np.concatenate(rpn_bboxes, 0).reshape(batch_size, -1 , 4)
+            rpn_bboxes = np.concatenate(rpn_bboxes, 0).reshape(batch_size, -1 , 4)
+            yield [images, bboxes, class_ids, active_ids, rpn_matchs, rpn_bboxes],[]
+
+    model.training(dataGen)
+    
 
 
 
