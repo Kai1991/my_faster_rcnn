@@ -8,7 +8,7 @@ from keras.utils.vis_utils import plot_model
 import keras
 import utils
 import proposal_func
-
+import detection_target_fixed
 
 ##########################################################################
 #
@@ -624,11 +624,11 @@ class FasterRcnn():
                                 scales=config.scales,rpn_stride=config.rpn_stride,anchor_stride=config.anchor_stride) # shape(576,4)
 
         #proposal 提取边框
-        proposals = proposal(proposal_count=16,nms_thresh=0.7,anchors=anchors,batch_size=config.batch_size,config=config)([rpn_prob,rpn_bbox])
+        proposals = proposal_func.proposal(proposal_count=16,nms_thresh=0.7,anchors=anchors,batch_size=config.batch_size,config=config)([rpn_prob,rpn_bbox])
 
         if mode == 'training':
             # 将proposal 和 真值 转化成  fpn的训练数据 delta
-            target_rois, target_class_ids, target_delta, target_bboxes = DetectionTarget(config,name="proposal_target")([proposals,input_class_ids,gt_bboxes])
+            target_rois, target_class_ids, target_delta, target_bboxes = detection_target_fixed.DetectionTarget(config,name="proposal_target")([proposals,input_class_ids,gt_bboxes])
 
             denomrlaize_rois = KL.Lambda(lambda x: 8.0 * x,name="denormalized_rois")(target_rois) #把roi放在特征图的维度上 proposals 是归一化后的数据
 
