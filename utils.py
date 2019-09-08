@@ -152,7 +152,31 @@ def build_rpnTarget(boxes, anchors, config):
         ix += 1
     return rpn_match, rpn_bboxes
 
+ 
+def batch_slice(inputs, graph_fn, batch_size, names=None):
     
+    if not isinstance(inputs, list):
+        inputs = [inputs]
+
+    outputs = []
+    for i in range(batch_size):
+        inputs_slice = [x[i] for x in inputs]
+        output_slice = graph_fn(*inputs_slice)
+        if not isinstance(output_slice, (tuple, list)):
+            output_slice = [output_slice]
+        outputs.append(output_slice)
+        
+    outputs = list(zip(*outputs))
+
+    if names is None:
+        names = [None] * len(outputs)
+
+    result = [tf.stack(o, axis=0, name=n)
+              for o, n in zip(outputs, names)]
+    if len(result) == 1:
+        result = result[0]
+    return result
+
 
 class shapeData():
     def __init__(self, image_size, config):
@@ -236,13 +260,6 @@ class shapeData():
 
 if __name__ == "__main__":
 
-    size_Y = 16
-    size_X = 16
-    rpn_stride = 8
-
-    scales = [2,4,8]
-    ratios = [0.5,1,2]
-
-    box = anchor_gen(size_X,size_Y,rpn_stride,scales,ratios)
-
-    print(box.shape)
+    
+    windows = np.array([0,0,10,10]).astype(np.float32)
+    print(windows)

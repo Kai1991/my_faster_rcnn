@@ -7,6 +7,7 @@ import numpy as np
 from keras.utils.vis_utils import plot_model
 import keras
 import utils
+import proposal_func
 
 
 ##########################################################################
@@ -68,28 +69,28 @@ def resnet_feature_extractor(inputs):
 #
 ##########################################################################
 
-def rpn_net(inputs,k):
+def rpn_net(inputs,k=9):
     #构建rpn网络
 
-    # inputs : 特证图
+    # inputs : 特证图 shape(batch_size,8,8,1024)
     # k : 特证图上anchor的个数
 
     # 返回值： 
     #   rpn分类
     #   rpn分类概率
     #   rpn回归
-    shared_map = KL.Conv2D(256,(3,3),padding='same')(inputs)
+    shared_map = KL.Conv2D(256,(3,3),padding='same')(inputs) #shape(batch_size,8,8,256)
     shared_map = KL.Activation("linear")(shared_map)
 
-    rpn_class = KL.Conv2D(2*k,(1,1))(shared_map)
+    rpn_class = KL.Conv2D(2*k,(1,1))(shared_map) #shape(batch_size,8,8,2*k)
     rpn_class = KL.Lambda(lambda x : tf.reshape(x,(tf.shape(x)[0],-1,2)))(rpn_class)
-    rpn_class = KL.Activation('linear')(rpn_class)
+    rpn_class = KL.Activation('linear')(rpn_class) #shape(batch_size,8*8*k,2)
     
     rpn_prob = KL.Activation('softmax')(rpn_class)
 
-    rpn_bbox = KL.Conv2D(4*k,(1,1))(shared_map)
+    rpn_bbox = KL.Conv2D(4*k,(1,1))(shared_map) #shape(batch_size,8,8,4*k)
     rpn_bbox = KL.Activation('linear')(rpn_bbox)
-    rpn_bbox = KL.Lambda(lambda x : tf.reshape(x,(tf.shape(x)[0],-1,4)))(rpn_bbox)
+    rpn_bbox = KL.Lambda(lambda x : tf.reshape(x,(tf.shape(x)[0],-1,4)))(rpn_bbox) #shape(batch_size,8*8*k,4) 8*8*9 = 576
 
     return rpn_class,rpn_prob,rpn_bbox
 
@@ -147,6 +148,7 @@ def rpn_bbox_loss(target_bbox,rpn_matchs,rpn_bbox):
 def anchor_refinement(boxes,deltas):
     boxes = tf.cast(boxes,tf.float32)
 
+    #计算被调节框的中心点和高和宽
     h = boxes[:,2] - boxes[:,0]
     w = boxes[:,3] - boxes[:,1]
     center_y = boxes[:,0] + h/2
@@ -158,6 +160,7 @@ def anchor_refinement(boxes,deltas):
     h *= tf.exp(deltas[:,2])
     w *= tf.exp(deltas[:,3])
 
+    #再转化成 （min_y,min_x,max_y,max_x）
     y1 = center_y - h/2
     x1 = center_x - w/2
     y2 = center_y + h/2
@@ -169,11 +172,11 @@ def anchor_refinement(boxes,deltas):
 #防止边框超出图片范围
 def boxes_clip(boxes, window):
     wy1,wx1,wy2,wx2 = tf.split(window,4)
-    y1,x1,y2,x2 = tf.split(boxes,4)
-    y1 = tf.maximum(y1,wy1)
-    x1 = tf.maximum(x1,wx1)
-    y2 = tf.minimum(y2,wy2)
-    x2 = tf.minimum(x2,wx2)
+    y1,x1,y2,x2 = tf.split(boxes,4,axis=1)
+    y1 = tf.maximum(tf.minimum(y1,wy2),wy1)
+    x1 = tf.maximum(tf.minimum(x1,wx2),wx1)
+    y2 = tf.maximum(tf.minimum(y2,wy2),wy1)
+    x2 = tf.maximum(tf.minimum(x2,wx2),wx1)
 
     cliped = tf.concat([y1,x1,y2,x2],axis=1)
     cliped.set_shape((cliped.shape[0], 4))#?
@@ -181,7 +184,7 @@ def boxes_clip(boxes, window):
 
 # 分片处理
 def batch_slice(inputs,graph_fn,batch_size,names=None):
-    if not isinstance(inputs):
+    if not isinstance(inputs,list):
         inputs = [inputs]
     out_puts = []
     for i in range(batch_size):
@@ -191,7 +194,7 @@ def batch_slice(inputs,graph_fn,batch_size,names=None):
             output_slice = [output_slice]
         out_puts.append(output_slice)
     out_puts = list(zip(*out_puts))
-    if names is None:
+    if names is not None:
         result = [tf.stack(o, axis=0, name=n)
               for o, n in zip(out_puts, names)]
     else:
@@ -203,29 +206,33 @@ def batch_slice(inputs,graph_fn,batch_size,names=None):
 
 class proposal(KE.Layer):
     def __init__(self,proposal_count,nms_thresh,anchors,batch_size,config,**kwargs):
-        super(proposal,self).__init__(kwargs)
+        super(proposal,self).__init__(**kwargs)
         self.proposal_count = proposal_count
         self.anchors = anchors
         self.nms_thresh = nms_thresh
         self.batch_size = batch_size
         self.config = config
     def call(self,inputs):
-        probs = inputs[0][:,:,1]
+        probs = inputs[0][:,:,1] #shape(batch_size,576,1)
         deltas = inputs[1]
-        deltas = deltas * np.reshape(self.config.RPN_BBOX_STD_DEV,(1,1,4))
-        prenms = min(100,self.anchors.shape[0])
-        idxs = tf.nn.top_k(probs,prenms).indices
+        deltas = deltas * np.reshape(self.config.RPN_BBOX_STD_DEV,(1,1,4)) #denormalization
+        prenms = min(100,self.anchors.shape[0]) #最多取出100个
+        idxs = tf.nn.top_k(probs,prenms).indices # 钱top
 
+        #提取相关数据
         probs = batch_slice([probs,idxs],lambda x,y :tf.gather(x,y),self.batch_size)
         deltas = batch_slice([deltas,idxs],lambda x,y :tf.gather(x,y),self.batch_size)
-        anchors = batch_slice([idxs],lambda x : tf.gather(self.anchors,idxs),self.batch_size)
+        anchors = batch_slice([idxs],lambda x : tf.gather(self.anchors,x),self.batch_size) #批次内对应的每组anchor
 
-        refined_boxes = batch_slice([anchors,deltas],lambda x,y:anchor_refinement(x,y),self.batch_size)
+        refined_boxes = batch_slice([anchors,deltas],lambda x,y:anchor_refinement(x,y),self.batch_size) #调整anchor
 
+        #防止 proposal 的框超出图片区域，剪切一下
         H,W = self.config.image_size[:2]
         windows = np.array([0,0,H,W]).astype(np.float32)
         cliped_boxes = batch_slice([refined_boxes], lambda x: boxes_clip(x,windows),self.batch_size)
-        normalized_boxes = cliped_boxes / np.arange([H,W,H,W])
+
+        # 对proposal进行归一化  使用的是图片大小进行归一化的
+        normalized_boxes = cliped_boxes / tf.constant([H,W,H,W],dtype=tf.float32)
 
         def nms(normalized_boxes, scores):
             idxs_ = tf.image.non_max_suppression(normalized_boxes,scores,self.proposal_count,self.nms_thresh)
@@ -233,13 +240,10 @@ class proposal(KE.Layer):
             pad_num = tf.maximum(self.proposal_count - tf.shape(box)[0],0)
             box = tf.pad(box,[(0,pad_num),(0,0)])# 填充0
             return box
-        
+        # 对proposal进行nms 最大值抑制
         proposal_ = batch_slice([normalized_boxes,probs],lambda x,y : nms(x,y),self.batch_size)
         return proposal_
   
-
-
-
         
     def compute_output_shape(self,input_shape):
         return (None,self.proposal_count,4)
@@ -251,11 +255,12 @@ class proposal(KE.Layer):
 #
 ##########################################################################
 # 去除非0 的部分
-def trim_zeros_graph(boxes,name=None):
-    none_zero = tf.cast(tf.reduce_sum(tf.abs(boxes),axis=1),tf.bool)
-    boxes = tf.boolean_mask(boxes,none_zero,name=name)
+def trim_zeros_graph(x,name=None):
+    none_zero = tf.cast(tf.reduce_sum(tf.abs(x),axis=1),tf.bool)
+    boxes = tf.boolean_mask(x,none_zero,name=name)
     return boxes,none_zero
 
+#todo 需要再看一边
 def overlaps_graph(boxes1, boxes2):
     b1 = tf.reshape(tf.tile(tf.expand_dims(boxes1,1),[1,1,tf.shape(boxes2)[0]]),[-1,4])
     b2 = tf.tile(boxes2,[tf.shape(boxes1)[0],1])
@@ -263,33 +268,35 @@ def overlaps_graph(boxes1, boxes2):
     b1_y1,b1_x1,b1_y2,b1_x2 = tf.split(b1,4,axis=1)
     b2_y1,b2_x1,b2_y2,b2_x2 = tf.split(b2,4,axis=1)
 
-    y1 = tf.maximun(b1_y1,b2_y1)
-    x1 = tf.maximun(b1_x1,b2_x1)
-    y2 = tf.minimun(b1_y2,b2_y2)
-    x2 = tf.minimun(b1_x1,b2_x1)
+    y1 = tf.maximum(b1_y1,b2_y1)
+    x1 = tf.maximum(b1_x1,b2_x1)
+    y2 = tf.minimum(b1_y2,b2_y2)
+    x2 = tf.minimum(b1_x1,b2_x1)
 
-    intersection = tf.maximun((y2-y1),0) * tf.maximun((x2-x1),0)
+    intersection = tf.maximum((y2-y1),0) * tf.maximum((x2-x1),0)
     union = (b1_y2 - b1_y1) * (b1_x2 - b1_x1) + (b2_y2 - b2_y1)*(b2_x2 - b2_x1) - intersection
     iou = intersection / union
     overlaps = tf.reshape(iou, [tf.shape(boxes1)[0], tf.shape(boxes2)[0]])
     return overlaps
 
 def box_refinement_graph(boxes, gt_box):
+    
     boxes = tf.cast(boxes,tf.float32)
     gt_box = tf.cast(gt_box,tf.float32)
+    
 
-    height = boxes[2] - boxes[0]
-    weight = boxes[3] - boxes[1]
-    center_y = boxes[0] + height/2
-    center_x = boxes[1] + weight/2
+    height = boxes[:,2] - boxes[:,0]
+    weight = boxes[:,3] - boxes[:,1]
+    center_y = boxes[:,0] + 0.5 * height
+    center_x = boxes[:,1] + 0.5 * weight
 
-    gt_height = gt_box[2] - gt_box[0]
-    gt_weight = gt_box[3] - gt_box[1]
-    gt_center_y = gt_box[0] + gt_box/2
-    gt_center_x = gt_box[1] + gt_box/2
+    gt_height = gt_box[:,2] - gt_box[:,0]
+    gt_weight = gt_box[:,3] - gt_box[:,1]
+    gt_center_y = gt_box[:,0] + 0.5 * gt_height
+    gt_center_x = gt_box[:,1] + 0.5 * gt_weight
 
-    dy = (gt_height - center_y)/height
-    dx = (gt_weight - center_x)/weight
+    dy = (gt_center_y - center_y)/height # 为什么会除以proposal的高和宽
+    dx = (gt_center_x - center_x)/weight
     dh = tf.log(gt_height/height)
     dw = tf.log(gt_weight/weight)
 
@@ -297,8 +304,8 @@ def box_refinement_graph(boxes, gt_box):
     return deltas
 
 def detection_target_graph(proposals, gt_class_ids, gt_bboxes, config):
-    #去除非0 部分
-    proposals,_ = trim_zeros_graph(proposals,name='trim_proposals')
+    #提取非0 部分：输入，ptoposal 为了固定长度使用 0进行padding
+    proposals,_ = trim_zeros_graph(proposals,name='trim_proposals') 
     gt_bboxes,none_zeros = trim_zeros_graph(gt_bboxes,name='trim_bboxes')
     gt_class_ids = tf.boolean_mask(gt_class_ids,none_zeros)
 
@@ -310,7 +317,7 @@ def detection_target_graph(proposals, gt_class_ids, gt_bboxes, config):
 
     positive_mask = max_iouArg > 0.5 #大于0.5的为前景
     positive_idxs = tf.where(positive_mask)[:,0] # 前景索引
-    negative_idxs = tf.where(max_iouArg <= 0.5)[:,0] # 背景索引
+    negative_idxs = tf.where(max_iouArg < 0.5)[:,0] # 背景索引
 
 
     num_positive = int(config.num_proposals_train *  config.num_proposals_ratio) #前景的数量
@@ -330,8 +337,9 @@ def detection_target_graph(proposals, gt_class_ids, gt_bboxes, config):
     # 取出前景对应的gt_bbox
     positive_overlap = tf.gather(overlaps,positive_idxs)
     gt_assignment = tf.argmax(positive_overlap,axis=1)
-    gt_bboxes = tf.gather(positive_overlap,gt_assignment)
+    gt_bboxes = tf.gather(gt_bboxes,gt_assignment)
     gt_class_ids = tf.gather(gt_class_ids,gt_assignment)
+
 
     # 计算偏移量
     deltas = box_refinement_graph(positive_rois, gt_bboxes)
@@ -361,14 +369,13 @@ class DetectionTarget(KE.Layer):
         names = ["rois", "target_class_ids", "target_deltas","target_bbox"]
 
         outputs = batch_slice([proposals,gt_class_ids,gt_bboxes],
-                    lambda x,y,z:detection_target_graph(x,y,z,self.config),self.config.bash_size,names)
+                    lambda x,y,z:detection_target_graph(x,y,z,self.config),self.config.batch_size,names)
 
         return outputs
 
 
     def compute_output_shape(self,input_shape):
-        pass
-
+        return [None, None, None, None]
 
 
 ##########################################################################
@@ -425,9 +432,9 @@ class RoiPoolingConvV2(KE.Layer):
         super(RoiPoolingConvV2,self).__init__(**kwargs)
 
     def build(self,input_shape):
-        if self.dim_ordering() == 'th':
+        if self.dim_ordering == 'th':
             self.nb_channels = input_shape[0][1]
-        if self.dim_ordering() == 'tf':
+        if self.dim_ordering == 'tf':
             self.nb_channels = input_shape[0][3]
     
     def compute_output_shape(self,input_shape):
@@ -440,7 +447,7 @@ class RoiPoolingConvV2(KE.Layer):
         assert(len(x) == 2)
 
         img = x[0]
-        rois = [1]
+        rois = x[1]
 
         out = batch_slice([img,rois],lambda x,y: roi_pooling_onebacth(x,y,self.num_rois, self.pool_size, self.nb_channels), \
                                 batch_size=self.batch_size)
@@ -450,13 +457,15 @@ class RoiPoolingConvV2(KE.Layer):
     def get_config(self):
         config = {'pool_size': self.pool_size,
                   'num_rois': self.num_rois}
-        base_config = super(RoiPoolingConv, self).get_config()
+        base_config = super(RoiPoolingConvV2, self).get_config()
         return dict(list(base_config.items()) + list(config.items())) 
   
 
 def fpn_classifiler(feature_map, rois, batch_size, num_rois, pool_size, num_classes):
     x = RoiPoolingConvV2(7,num_rois,batch_size)([feature_map,rois])
-    x = KL.TimeDistributed(KL.Conv2D(512,pool_size,padding='valid'),name="mrcnn_class_conv1")(x)
+    print(feature_map)
+    print(x)
+    x = KL.TimeDistributed(KL.Conv2D(512, pool_size, padding="valid"),name="mrcnn_class_conv1")(x)
     x = KL.TimeDistributed(BatchNorm(axis=3),name="fpn_classifier_bn0")(x)
     x = KL.Activation('relu')(x)
 
@@ -526,8 +535,54 @@ def mrcnn_class_loss_graphV2(target_class_ids, pred_class_logits,active_class_id
     loss = tf.reduce_sum(loss) / tf.reduce_sum(pred_active)
     return loss
                 
+##########################################################################
+#
+#                          DetectionLayer
+#
+##########################################################################
 
+def refine_detections(rois, probs, deltas):
+    argMax_probs = tf.argmax(probs, axis=1)
+    max_probs = tf.reduce_max(probs, axis=1)
+    keep_idxs = tf.where(max_probs > 0.5)[:,0]
+    idx_y = tf.cast(np.arange(16), tf.int32)
+    idx_x = tf.cast(argMax_probs, tf.int32)
+    idxs = tf.stack([idx_y, idx_x],axis=1)
+    deltas_keep = tf.gather_nd(deltas, idxs)
+    refined_rois = anchor_refinement(tf.cast(rois, tf.float32),
+                                 tf.cast(deltas_keep * config.RPN_BBOX_STD_DEV, tf.float32))
+    rois_ready = tf.gather(refined_rois, keep_idxs)
+    class_ids = tf.gather(argMax_probs, keep_idxs)
+    class_ids = tf.to_float(class_ids)[..., tf.newaxis]
+    detections = tf.concat([rois_ready, class_ids], axis=1)
+    gap = tf.maximum(16 - tf.shape(detections)[0],0)
+    detections = tf.pad(detections, [(0, gap), (0, 0)], "CONSTANT")
+    return detections
 
+### NMS
+
+class DetectionLayer(KE.Layer):
+
+    def __init__(self, **kwargs):
+        super(DetectionLayer, self).__init__(**kwargs)
+
+    def call(self, inputs):
+        rois = inputs[0]
+        probs = inputs[1]
+        deltas = inputs[2]
+        
+        detections_batch = utils.batch_slice(
+            [rois, probs, deltas],
+            lambda x, y, z: refine_detections(x, y, z),
+            20)
+        
+        #return tf.reshape(
+        #    detections_batch,
+        #    [16, 8, -1])
+        return detections_batch
+
+    def compute_output_shape(self, input_shape):
+        return (None, 8, -1)
 
 ##########################################################################
 #
@@ -560,23 +615,27 @@ class FasterRcnn():
         imgae_scale = K.cast(tf.stack([h,w,h,w]),tf.float32)
         gt_bboxes = KL.Lambda(lambda x : x/imgae_scale)(input_bboxes)
 
-        feature_map = resnet_feature_extractor(input_image) # 特征提取
-        rpn_class,rpn_prob,rpn_bbox = rpn_net(feature_map,9) # rpn 推荐 # todo
+
+        feature_map = resnet_feature_extractor(input_image) # 特征提取  输出的shape(batch_size,8,8,1024)
+        rpn_class,rpn_prob,rpn_bbox = rpn_net(feature_map,9) # rpn 推荐  shape(batch_size,576,2),shape(batch_size,576,1),shape(batch_size,576,4)                    # todo  
 
         #获取anchors 
         anchors = utils.anchor_gen(featureMap_size=[8,8],ratios=config.ratios, #todo
-                                scales=config.scales,rpn_stride=config.rpn_stride,anchor_stride=config.anchor_stride)
+                                scales=config.scales,rpn_stride=config.rpn_stride,anchor_stride=config.anchor_stride) # shape(576,4)
 
-        proposals = proposal(config.proposal_count,nms_thresh=0.7,anchros=anchors,batch_size=config.batch_size)([rpn_prob,rpn_bbox])
+        #proposal 提取边框
+        proposals = proposal(proposal_count=16,nms_thresh=0.7,anchors=anchors,batch_size=config.batch_size,config=config)([rpn_prob,rpn_bbox])
 
         if mode == 'training':
+            # 将proposal 和 真值 转化成  fpn的训练数据 delta
             target_rois, target_class_ids, target_delta, target_bboxes = DetectionTarget(config,name="proposal_target")([proposals,input_class_ids,gt_bboxes])
 
-            denomrlaize_rois = KL.Lambda(lambda x: 8.0*x,name="denormalized_rois")(target_rois) #把roi放在特征图的维度上
+            denomrlaize_rois = KL.Lambda(lambda x: 8.0 * x,name="denormalized_rois")(target_rois) #把roi放在特征图的维度上 proposals 是归一化后的数据
 
-            #过分类和回归
-            mrcnn_class_logits, mrcnn_class, mrcnn_bbox = fpn_classifiler(feature_map, denomrlaize_rois, 20, 21, 7, 4)
-
+            #分类和回归 
+            mrcnn_class_logits, mrcnn_class, mrcnn_bbox = fpn_classifiler(feature_map, denomrlaize_rois, 
+                                                batch_size=config.batch_size, num_rois=21, pool_size=7, num_classes=4)
+            
             #rpn_loss
             loss_rpn_match = KL.Lambda(lambda x:rpn_class_loss(*x),name='loss_rpn_match')([input_rpn_match,rpn_prob])
             loss_rpn_bbox = KL.Lambda(lambda x:rpn_bbox_loss(*x),name='loss_rpn_bbox')([input_rpn_box,rpn_bbox])
@@ -761,8 +820,8 @@ if __name__ == "__main__":
     config = Config()
     dataset = dataSet([64,64], config=config)
 
-    model = fasterRCNN(mode="training", subnet="all", config=config)
-
+    model = FasterRcnn(mode="training", subnet="all", config=config)
+    '''
     def data_Gen(dataset, num_batch, batch_size, config):
         for _ in range(num_batch):
             images = []
@@ -794,7 +853,9 @@ if __name__ == "__main__":
             rpn_bboxes = np.concatenate(rpn_bboxes, 0).reshape(batch_size, -1 , 4)
             yield [images, bboxes, class_ids, active_ids, rpn_matchs, rpn_bboxes],[]
 
+    dataGen = data_Gen(dataset, 35000, 20, config)
     model.training(dataGen)
+    '''
     
 
 
