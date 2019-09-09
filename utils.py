@@ -7,8 +7,12 @@ import math
 import random
 import cv2
 import keras.engine as KE
-
-       
+# 功能：构建 anchor
+# featureMap_size=[8,8] 特征图大小
+# ratios=[0.5, 1, 2]    宽高比
+# scales=[4, 8, 16]     anchor的面积  
+# rpn_stride=1          rpn的步长
+# anchor_stride=1       anchor的步长             
 def anchor_gen(featureMap_size, ratios, scales, rpn_stride, anchor_stride):
     ratios, scales = np.meshgrid(ratios, scales)
     ratios, scales = ratios.flatten(), scales.flatten()
@@ -192,9 +196,9 @@ class shapeData():
 #        rpn_bboxes = []
         anchors = anchor_gen(self.config.featureMap_size, self.config.ratios, self.config.scales, self.config.rpn_stride, self.config.anchor_stride)
 
-        images, bboxs, ids = self.random_image(self.image_size)
+        images, bboxs, ids, active_ids = self.random_image(self.image_size)
         rpn_match, rpn_bboxes = build_rpnTarget(bboxs, anchors, self.config)
-        return images, bboxs, ids, rpn_match, rpn_bboxes, anchors
+        return images, bboxs, ids, active_ids, rpn_match, rpn_bboxes, anchors
         
     def random_image(self, image_size):
         typeDict = {'square':1, 'circle':2, 'triangle':3}
@@ -208,6 +212,7 @@ class shapeData():
         #num_obj = 1                     
         bboxs = np.zeros((num_obj, 4))
         Ids = np.zeros((num_obj, 1))
+        active_ids = np.array([1, 0, 0, 0])
         shapes = []
         dims = np.zeros((num_obj, 3))
         for i in range(num_obj):
@@ -227,6 +232,9 @@ class shapeData():
         keep_idxs = non_max_suppression(bboxs, np.arange(num_obj), 0.01)
         bboxs = bboxs[keep_idxs]
         Ids = Ids[keep_idxs]
+        active_ids_ = np.unique(Ids)
+        for k in range(active_ids_.shape[0]):
+            active_ids[int(active_ids_[k])]=1
         shapes = [shapes[i] for i in keep_idxs]
         dims = dims[keep_idxs]
         for j in range(bboxs.shape[0]):
@@ -234,7 +242,7 @@ class shapeData():
             shape = shapes[j]
             dim = dims[j]
             image = self.draw_shape(image, shape, dim, color)
-        return image, bboxs, Ids
+        return image, bboxs, Ids, active_ids
     
     def draw_shape(self, image, shape, dims, color):
         x, y, s = dims.astype(np.int32)
@@ -255,11 +263,9 @@ class shapeData():
         bbox = [x-s, y-s, x+s, y+s]
         bbox = np.array(bbox)
         return bbox
+        
 
 
 
 if __name__ == "__main__":
-
     
-    windows = np.array([0,0,10,10]).astype(np.float32)
-    print(windows)
