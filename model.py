@@ -7,8 +7,99 @@ import numpy as np
 from keras.utils.vis_utils import plot_model
 import keras
 import utils
-import proposal_func
-import detection_target_fixed
+
+##########################################################################
+#
+#                          标准 Resnet —— 50 101
+#
+##########################################################################
+def conv_block(kernel_size, filters, stage, block,
+               strides=(2, 2), use_bias=True, train_bn=True):
+    #
+    conv_name_base = 'res' + str(stage) + block + '_branch'
+    bn_name_base = 'bn' + str(stage) + block + '_branch'
+
+    def f(input_tensor):
+        x = KL.Conv2D(filters,(1,1),strides=strides,name=conv_name_base+'2a',use_bias=use_bias)(input_tensor)
+        x = BatchNorm(name=bn_name_base + '2a')(x,training=train_bn)
+        x = KL.Activation('relu')(x)
+
+        x = KL.Conv2D(filters,(kernel_size,kernel_size),strides=(1,1),name=conv_name_base+'2b',use_bias=use_bias)(x)
+        x = BatchNorm(name=bn_name_base + '2b')(x,training=train_bn)
+        x = KL.Activation('relu')(x)
+
+        x = KL.Conv2D(4 * filters,(1,1),strides=(1,1),name=conv_name_base+'2c',use_bias=use_bias)(x)
+        x = BatchNorm(name=bn_name_base + '2c')(x,training=train_bn)
+        x = KL.Activation('relu')(x)
+
+        shortcut = KL.Conv2D(4 * filters, (1, 1), strides=strides,
+                         name=conv_name_base + '1', use_bias=use_bias)(input_tensor)
+        shortcut = BatchNorm(name=bn_name_base + '1')(shortcut, training=train_bn)
+
+        x = KL.Add()([x, shortcut])
+        x = KL.Activation('relu', name='res' + str(stage) + block + '_out')(x)
+        return x
+
+    return f
+
+def identity_block(kernel_size, filters, stage, block,
+               strides=(2, 2), use_bias=True, train_bn=True):
+    #
+    conv_name_base = 'res' + str(stage) + block + '_branch'
+    bn_name_base = 'bn' + str(stage) + block + '_branch'
+
+    def f(input_tensor):
+        x = KL.Conv2D(filters,(1,1),strides=strides,name=conv_name_base+'2a',use_bias=use_bias)(input_tensor)
+        x = BatchNorm(name=bn_name_base + '2a')(x,training=train_bn)
+        x = KL.Activation('relu')(x)
+
+        x = KL.Conv2D(filters,(kernel_size,kernel_size),strides=(1,1),name=conv_name_base+'2b',use_bias=use_bias)(x)
+        x = BatchNorm(name=bn_name_base + '2b')(x,training=train_bn)
+        x = KL.Activation('relu')(x)
+
+        x = KL.Conv2D(4 * filters,(1,1),strides=(1,1),name=conv_name_base+'2c',use_bias=use_bias)(x)
+        x = BatchNorm(name=bn_name_base + '2c')(x,training=train_bn)
+        x = KL.Activation('relu')(x)
+
+        x = KL.Add()([x, input_tensor])
+        x = KL.Activation('relu', name='res' + str(stage) + block + '_out')(x)
+        return x
+    return f
+
+def resnet_graph(input_image, architecture,train_bn=True,stage5=True):
+    # input_image 输入的图片
+    # architecture 结构，resnet_50 ,resnet_101
+    # train_bn 是否训练
+    
+    #stage1
+    x = KL.ZeroPadding2D((3,3))(input_image)
+    x = KL.Conv2D(64,(7,7),strides=(2,2),name='conv1',use_bias=True)(x)
+    x = BatchNorm(name='bn_conv1')(x,training=train_bn)
+    x = KL.Activation('relu')(x)
+    C1 = x = KL.MaxPool2D(pool_size=(3,3),strides=(2,2),padding='same')(x)
+    #stage2
+    x = conv_block(3, 64, stage=2, block='a', strides=(1, 1), train_bn=train_bn)(x)
+    x = identity_block(3,64, stage=2, block='b', train_bn=train_bn)(x)
+    C2 = x = identity_block(3, 64, stage=2, block='c', train_bn=train_bn)(x)
+    # Stage 3
+    x = conv_block( 3, 128, stage=3, block='a', train_bn=train_bn)(x)
+    x = identity_block(3, 128, stage=3, block='b', train_bn=train_bn)(x)
+    x = identity_block( 3, 128, stage=3, block='c', train_bn=train_bn)(x)
+    C3 = x = identity_block(3, 128, stage=3, block='d', train_bn=train_bn)(x)
+    # Stage 4
+    x = conv_block(3, 256, stage=4, block='a', train_bn=train_bn)(x)
+    block_count = {"resnet50": 5, "resnet101": 22}[architecture]
+    for i in range(block_count):
+        x = identity_block( 3, 256, stage=4, block=chr(98 + i), train_bn=train_bn)(x)
+    C4 = x
+    # Stage 5
+    if stage5:
+        x = conv_block(3, 512, stage=5, block='a', train_bn=train_bn)(x)
+        x = identity_block(3, 512, stage=5, block='b', train_bn=train_bn)(x)
+        C5 = x = identity_block(3,512, stage=5, block='c', train_bn=train_bn)(x)
+    else:
+        C5 = None
+    return [C1, C2, C3, C4, C5]
 
 ##########################################################################
 #
@@ -133,7 +224,7 @@ def rpn_bbox_loss(target_bbox,rpn_matchs,rpn_bbox):
     rpn_bbox = tf.gather_nd(rpn_bbox,indices)# 从预测框中提取对应位置的框
 
     batch_counts = K.sum(K.cast(K.equal(rpn_matchs,1),'int32'),axis=1) #统计每个图片中有几个bbox
-    target_bbox = batch_back(target_bbox,batch_counts,20) #?
+    target_bbox = batch_back(target_bbox,batch_counts,20) 
     diff  = K.abs(target_bbox - rpn_bbox)
     less_than_one = K.cast(K.less(diff,1),'float32')
     loss = (less_than_one * 0.5 * diff**2) + (1 - less_than_one)*(diff - 0.5) #?
@@ -235,7 +326,7 @@ class proposal(KE.Layer):
         cliped_boxes = batch_slice([refined_boxes], lambda x: boxes_clip(x,windows),self.batch_size)
 
         # 对proposal进行归一化  使用的是图片大小进行归一化的
-        normalized_boxes = cliped_boxes / tf.constant([H,W,H,W],dtype=tf.float32)  #这里不一样
+        normalized_boxes = cliped_boxes / np.array([H, W, H, W])  #这里不一样
 
         def nms(normalized_boxes, scores):
             idxs_ = tf.image.non_max_suppression(normalized_boxes,scores,self.proposal_count,self.nms_thresh)
@@ -379,6 +470,12 @@ class DetectionTarget(KE.Layer):
 
 
     def compute_output_shape(self,input_shape):
+        return [(None, self.config.num_proposals_train, 4),
+                (None, 1),
+                (None, self.config.num_proposals_train, 4),
+                (None, self.config.num_proposals_train, 4)]
+    
+    def compute_mask(self, inputs, mask=None):
         return [None, None, None, None]
 
 
@@ -545,7 +642,7 @@ def mrcnn_class_loss_graphV2(target_class_ids, pred_class_logits,active_class_id
 #
 ##########################################################################
 
-def refine_detections(rois, probs, deltas):
+def refine_detections(rois, probs, deltas,config):
     argMax_probs = tf.argmax(probs, axis=1)
     max_probs = tf.reduce_max(probs, axis=1)
     keep_idxs = tf.where(max_probs > 0.5)[:,0]
@@ -567,7 +664,8 @@ def refine_detections(rois, probs, deltas):
 
 class DetectionLayer(KE.Layer):
 
-    def __init__(self, **kwargs):
+    def __init__(self, config,**kwargs):
+        self.config = config
         super(DetectionLayer, self).__init__(**kwargs)
 
     def call(self, inputs):
@@ -577,12 +675,9 @@ class DetectionLayer(KE.Layer):
         
         detections_batch = utils.batch_slice(
             [rois, probs, deltas],
-            lambda x, y, z: refine_detections(x, y, z),
+            lambda x, y, z: refine_detections(x, y, z,self.config),
             20)
         
-        #return tf.reshape(
-        #    detections_batch,
-        #    [16, 8, -1])
         return detections_batch
 
     def compute_output_shape(self, input_shape):
@@ -611,7 +706,7 @@ class FasterRcnn():
         input_image = KL.Input(shape=[h,w,3],dtype=tf.float32)
         input_bboxes = KL.Input(shape=[None,4],dtype=tf.float32)
         input_class_ids = KL.Input(shape=[None],dtype=tf.int32)
-        input_active_ids = KL.Input(shape=[4,], dtype=tf.int32) #?
+        input_active_ids = KL.Input(shape=[4,], dtype=tf.int32) 
         input_rpn_match = KL.Input(shape=[None,1],dtype=tf.int32)
         input_rpn_box = KL.Input(shape=[None,4],dtype=tf.float32)
 
@@ -628,11 +723,11 @@ class FasterRcnn():
                                 scales=config.scales,rpn_stride=config.rpn_stride,anchor_stride=config.anchor_stride) # shape(576,4)
 
         #proposal 提取边框
-        proposals = proposal_func.proposal(proposal_count=16,nms_thresh=0.7,anchors=anchors,batch_size=config.batch_size,config=config)([rpn_prob,rpn_bbox])
+        proposals = proposal(proposal_count=16,nms_thresh=0.7,anchors=anchors,batch_size=config.batch_size,config=config)([rpn_prob,rpn_bbox])
         #shape(batch_size,16,4)   
         if mode == 'training':
             # 将proposal 和 真值 转化成  fpn的训练数据 delta
-            target_rois, target_class_ids, target_delta, target_bboxes = detection_target_fixed.DetectionTarget(config,name="proposal_target")([proposals,input_class_ids,gt_bboxes])
+            target_rois, target_class_ids, target_delta, target_bboxes = DetectionTarget(config,name="proposal_target")([proposals,input_class_ids,gt_bboxes])
             # （batch_size,21,4）,（batch_size,21,1）,（batch_size,21,4）,（batch_size,21,4）
 
             denomrlaize_rois = KL.Lambda(lambda x: 8.0 * x,name="denormalized_rois")(target_rois) #把roi放在特征图的维度上 proposals 是归一化后的数据
@@ -661,7 +756,7 @@ class FasterRcnn():
         if mode == "inference":
             denomrlaize_proposals = KL.Lambda(lambda x:8.0*x, name="denormalized_proposals")(proposals)
             mrcnn_class_logits, mrcnn_class, mrcnn_bbox = fpn_classifiler(feature_map, denomrlaize_proposals, 20, 16, 7, 4)
-            detections = DetectionLayer()([proposals, mrcnn_class, mrcnn_bbox])
+            detections = DetectionLayer(self.config)([proposals, mrcnn_class, mrcnn_bbox])
             
             model = Model([input_image],[detections])
 
@@ -710,10 +805,11 @@ class FasterRcnn():
     def loadWeights(self,weights_path):
         self.keras_model.load_weights(weights_path, by_name=True)
 
-    
+
 
 
 if __name__ == "__main__":
+    '''
     from utils import shapeData as dataSet
     from config import Config
     config = Config()
@@ -758,7 +854,20 @@ if __name__ == "__main__":
     #model.saveWeights('model_weights_rpn.h5')
     model.saveWeights('model_weights_all.h5')
     
-    
+    '''
+    from keras.utils import plot_model
+
+    input_tensor = KL.Input(shape=[None,None,3])
+    C1, C2, C3, C4, C5 = resnet_graph(input_tensor, architecture='resnet50',train_bn=True,stage5=True)
+
+    model = Model([input_tensor],[C1, C2, C3, C4, C5])
+
+    model.summary()
+
+    plot_model(model, to_file='resnet.png')
+
+
+
     
 
 

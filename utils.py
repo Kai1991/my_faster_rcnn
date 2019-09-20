@@ -14,20 +14,24 @@ import keras.engine as KE
 # rpn_stride=1          rpn的步长
 # anchor_stride=1       anchor的步长             
 def anchor_gen(featureMap_size, ratios, scales, rpn_stride, anchor_stride):
+    #得到9个anchor
     ratios, scales = np.meshgrid(ratios, scales)
     ratios, scales = ratios.flatten(), scales.flatten()
     
     width = scales / np.sqrt(ratios)
     height = scales * np.sqrt(ratios)
     
+    #得到特征图网格
     shift_x = np.arange(0, featureMap_size[0], anchor_stride) * rpn_stride
     shift_y = np.arange(0, featureMap_size[1], anchor_stride) * rpn_stride
     shift_x, shift_y = np.meshgrid(shift_x, shift_y)
+    #获取每个特征图上点的9个anchor
     centerX, anchorX = np.meshgrid(shift_x, width)
     centerY, anchorY = np.meshgrid(shift_y, height)
     boxCenter = np.stack([centerY, centerX], axis=2).reshape(-1, 2)
     boxSize = np.stack([anchorX, anchorY], axis=2).reshape(-1, 2)
     
+    #转换成 最小点 和最大点格式
     boxes = np.concatenate([boxCenter - 0.5 * boxSize, boxCenter + 0.5 * boxSize], axis=1)
     return boxes
 
@@ -268,4 +272,4 @@ class shapeData():
 
 
 if __name__ == "__main__":
-    
+    pass
