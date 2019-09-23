@@ -101,6 +101,34 @@ def resnet_graph(input_image, architecture,train_bn=True,stage5=True):
         C5 = None
     return [C1, C2, C3, C4, C5]
 
+
+def resne_fpn_feature_extractor(input_image, config):
+    _ , C2, C3, C4, C5 = resnet_graph(input_image, config.BACKBONE,config.TRAIN_BN)
+    #上采样
+    P5 = KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE,(1,1),name='fpn_c5p5')(C5)
+    P4 = KL.Add(name='fpn_p4add')([
+        KL.UpSampling2D(size=(2,2),name='fpn_p5upsampled')(P5),
+        KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE,(1,1),name='fpn_c4p4')(C4)
+    ])
+    P3 = KL.Add(name='fpn_p3add')([
+        KL.UpSampling2D(size=(2,2),name='fpn_p4upsampled')(P4),
+        KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE,(1,1),name='fpn_c3p3')(C3)
+    ])
+    P2 = KL.Add(name='fpn_p2add')([
+        KL.UpSampling2D(size=(2,2),name='fpn_p3upsampled')(P3),
+        KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE,(1,1),name='fpn_c2p2')(C2)
+    ])
+
+    P2 = KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (3, 3), padding="SAME", name="fpn_p2")(P2)
+    P3 = KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (3, 3), padding="SAME", name="fpn_p3")(P3)
+    P4 = KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (3, 3), padding="SAME", name="fpn_p4")(P4)
+    P5 = KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (3, 3), padding="SAME", name="fpn_p5")(P5)
+    P6 = KL.MaxPooling2D(pool_size=(1, 1), strides=2, name="fpn_p6")(P5)
+
+    rpn_feature_maps = [P2, P3, P4, P5, P6]
+
+    return rpn_feature_maps
+
 ##########################################################################
 #
 #                          Resnet
@@ -185,6 +213,31 @@ def rpn_net(inputs,k=9):
 
     return rpn_class,rpn_prob,rpn_bbox
 
+def rpn_graph(feature_map, anchors_per_location, anchor_stride):
+    shared = KL.Conv2D(512,(3,3),padding='same',activation='relu',
+                        strides=anchor_stride,name='rpn_conv_shared')(feature_map)
+    
+    x = KL.Conv2D(2* anchors_per_location,(1,1),padding='valid',
+                activation='linear',name='rpn_class_raw')(shared)
+    
+    rpn_class_logits = KL.Lambda(lambda  t: tf.reshape(t,[tf.shape(t)[0],-1,2]))(x)
+
+    rpn_probs = KL.Activation('softmax',name='rpn_class_xxx')(rpn_class_logits)
+
+    x = KL.Conv2D(anchors_per_location * 4, (1, 1), padding="valid",
+                  activation='linear', name='rpn_bbox_pred')(shared)
+
+    # Reshape to [batch, anchors, 4]
+    rpn_bbox = KL.Lambda(lambda t: tf.reshape(t, [tf.shape(t)[0], -1, 4]))(x)
+
+    return [rpn_class_logits, rpn_probs, rpn_bbox]
+
+
+
+def build_rpn_model(anchor_stride, anchors_per_location, depth):
+    input_feature_map = KL.Input(shape=[None,None,depth])
+    out_puts = rpn_graph(input_feature_map, anchors_per_location, anchor_stride)
+    return Model([input_feature_map],out_puts,name='rpn_model')
 ##########################################################################
 #
 #                          RPN_loss
@@ -715,8 +768,19 @@ class FasterRcnn():
         gt_bboxes = KL.Lambda(lambda x : x/imgae_scale)(input_bboxes)
 
 
-        feature_map = resnet_feature_extractor(input_image) # 特征提取  输出的shape(batch_size,8,8,1024)
-        rpn_class,rpn_prob,rpn_bbox = rpn_net(feature_map,9) # rpn 推荐  shape(batch_size,576,2),shape(batch_size,576,1),shape(batch_size,576,4)                    # todo  
+        feature_maps = resne_fpn_feature_extractor(input_image, config) # 特征提取  输出的shape(batch_size,8,8,1024)
+        
+        #构建
+        rpn = build_rpn_model(config.RPN_ANCHOR_STRIDE,len(config.ratios), config.TOP_DOWN_PYRAMID_SIZE)
+
+        #存放特征金字塔特征
+        layer_outouts = []
+        for p in feature_maps:
+            layer_outouts.append(rpn(p))
+
+        
+
+
 
         #获取anchors 
         anchors = utils.anchor_gen(featureMap_size=[8,8],ratios=config.ratios, #todo
@@ -856,13 +920,25 @@ if __name__ == "__main__":
     
     '''
     from keras.utils import plot_model
+    from config import Config 
+
+    config = Config()
 
     input_tensor = KL.Input(shape=[None,None,3])
-    C1, C2, C3, C4, C5 = resnet_graph(input_tensor, architecture='resnet50',train_bn=True,stage5=True)
+    feature_maps = resne_fpn_feature_extractor(input_tensor, config)
+    #构建
+    rpn = build_rpn_model(config.anchor_stride,len(config.ratios), config.TOP_DOWN_PYRAMID_SIZE)
 
-    model = Model([input_tensor],[C1, C2, C3, C4, C5])
+        #存放特征金字塔特征
+    layer_outouts = []
+    for p in feature_maps:
+        layer_outouts.append(rpn(p))
 
-    model.summary()
+        
+
+    model = Model([input_tensor],layer_outouts)
+
+    #model.summary()
 
     plot_model(model, to_file='resnet.png')
 

@@ -1,6 +1,9 @@
 import numpy as np
 
 class Config():
+    BACKBONE = 'resnet50'  #  'resnet50' 'resnet101' 使用的backbone
+    TRAIN_BN = True # 是否训练
+    TOP_DOWN_PYRAMID_SIZE = 256 # 特征金字塔最上层大小
     featureMap_size = [8, 8]
     scales = [4, 8, 16]
     ratios = [0.5, 1, 2]
