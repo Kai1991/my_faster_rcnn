@@ -208,9 +208,9 @@ class shapeData():
         typeDict = {'square':1, 'circle':2, 'triangle':3}
         H,W = image_size[0], image_size[1]
         #image = np.random.randn(H, W, 3)
-        red = np.ones((64,64,1))*30
-        green = np.ones((64,64,1))*60
-        blue = np.ones((64,64,1))*90
+        red = np.ones((H,W,1))*30
+        green = np.ones((H,W,1))*60
+        blue = np.ones((H,W,1))*90
         image = np.concatenate([red, green, blue], axis=2)
         num_obj = random.sample([1,2,3,4], 1)[0]
         #num_obj = 1                     

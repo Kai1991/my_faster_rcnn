@@ -7,6 +7,7 @@ import numpy as np
 from keras.utils.vis_utils import plot_model
 import keras
 import utils
+from config import Config
 
 ##########################################################################
 #
@@ -24,36 +25,30 @@ def conv_block(kernel_size, filters, stage, block,
         x = BatchNorm(name=bn_name_base + '2a')(x,training=train_bn)
         x = KL.Activation('relu')(x)
 
-        x = KL.Conv2D(filters,(kernel_size,kernel_size),strides=(1,1),name=conv_name_base+'2b',use_bias=use_bias)(x)
+        x = KL.Conv2D(filters,(kernel_size,kernel_size),name=conv_name_base+'2b',use_bias=use_bias,padding='same')(x)
         x = BatchNorm(name=bn_name_base + '2b')(x,training=train_bn)
         x = KL.Activation('relu')(x)
 
-        x = KL.Conv2D(4 * filters,(1,1),strides=(1,1),name=conv_name_base+'2c',use_bias=use_bias)(x)
+        x = KL.Conv2D(4 * filters,(1,1),name=conv_name_base+'2c',use_bias=use_bias)(x)
         x = BatchNorm(name=bn_name_base + '2c')(x,training=train_bn)
-        x = KL.Activation('relu')(x)
 
-        shortcut = KL.Conv2D(4 * filters, (1, 1), strides=strides,
-                         name=conv_name_base + '1', use_bias=use_bias)(input_tensor)
-        shortcut = BatchNorm(name=bn_name_base + '1')(shortcut, training=train_bn)
-
-        x = KL.Add()([x, shortcut])
-        x = KL.Activation('relu', name='res' + str(stage) + block + '_out')(x)
         return x
 
     return f
 
 def identity_block(kernel_size, filters, stage, block,
-               strides=(2, 2), use_bias=True, train_bn=True):
+                use_bias=True, train_bn=True):
     #
     conv_name_base = 'res' + str(stage) + block + '_branch'
     bn_name_base = 'bn' + str(stage) + block + '_branch'
 
     def f(input_tensor):
-        x = KL.Conv2D(filters,(1,1),strides=strides,name=conv_name_base+'2a',use_bias=use_bias)(input_tensor)
+        x = KL.Conv2D(filters,(1,1),name=conv_name_base+'2a',use_bias=use_bias)(input_tensor)
         x = BatchNorm(name=bn_name_base + '2a')(x,training=train_bn)
         x = KL.Activation('relu')(x)
 
-        x = KL.Conv2D(filters,(kernel_size,kernel_size),strides=(1,1),name=conv_name_base+'2b',use_bias=use_bias)(x)
+        x = KL.Conv2D(filters,(kernel_size,kernel_size),strides=(1,1),padding='same',
+            name=conv_name_base+'2b',use_bias=use_bias)(x)
         x = BatchNorm(name=bn_name_base + '2b')(x,training=train_bn)
         x = KL.Activation('relu')(x)
 
@@ -81,6 +76,7 @@ def resnet_graph(input_image, architecture,train_bn=True,stage5=True):
     x = conv_block(3, 64, stage=2, block='a', strides=(1, 1), train_bn=train_bn)(x)
     x = identity_block(3,64, stage=2, block='b', train_bn=train_bn)(x)
     C2 = x = identity_block(3, 64, stage=2, block='c', train_bn=train_bn)(x)
+    print(C2)
     # Stage 3
     x = conv_block( 3, 128, stage=3, block='a', train_bn=train_bn)(x)
     x = identity_block(3, 128, stage=3, block='b', train_bn=train_bn)(x)
@@ -126,8 +122,9 @@ def resne_fpn_feature_extractor(input_image, config):
     P6 = KL.MaxPooling2D(pool_size=(1, 1), strides=2, name="fpn_p6")(P5)
 
     rpn_feature_maps = [P2, P3, P4, P5, P6]
+    mrcnn_feature_maps = [P2, P3, P4, P5]
 
-    return rpn_feature_maps
+    return rpn_feature_maps,mrcnn_feature_maps
 
 ##########################################################################
 #
@@ -350,6 +347,15 @@ def batch_slice(inputs,graph_fn,batch_size,names=None):
     return result
 
 class proposal(KE.Layer):
+    '''
+    Inputs:
+        rpn_probs: [batch, num_anchors, (bg prob, fg prob)]
+        rpn_bbox: [batch, num_anchors, (dy, dx, log(dh), log(dw))]
+        anchors: [batch, num_anchors, (y1, x1, y2, x2)] anchors in normalized coordinates
+
+    Returns:
+        Proposals in normalized coordinates [batch, rois, (y1, x1, y2, x2)]
+    '''
     def __init__(self,proposal_count,nms_thresh,anchors,batch_size,config,**kwargs):
         super(proposal,self).__init__(**kwargs)
         self.proposal_count = proposal_count
@@ -362,8 +368,6 @@ class proposal(KE.Layer):
         deltas = inputs[1] #shape(batch_size,576,4)   
         deltas = deltas * np.reshape(self.config.RPN_BBOX_STD_DEV,(1,1,4)) #denormalization
         prenms = min(100,self.anchors.shape[0]) #最多取出100个
-        print("prenms:")
-        print(prenms)
         idxs = tf.nn.top_k(probs,prenms).indices # 钱top
 
         #提取相关数据
@@ -550,8 +554,7 @@ def log(val):
 #
 ##########################################################################
 # 切出roi
-def roi_pooling_onebacth(img, rois, num_rois, pool_size, nb_channels):
-    img = K.expand_dims(img, 0)
+def roi_pooling_onebacth(feature_maps, rois, num_rois, pool_size, nb_channels):
     outputs = []
     for roi_idx in range(num_rois):
 
@@ -614,10 +617,123 @@ class RoiPoolingConvV2(KE.Layer):
                   'num_rois': self.num_rois}
         base_config = super(RoiPoolingConvV2, self).get_config()
         return dict(list(base_config.items()) + list(config.items())) 
-  
+
+
+def log2_graph(x):
+    """Implementation of Log2. TF doesn't have a native implementation."""
+    return tf.log(x) / tf.log(2.0)
+
+class PyramidROIAlign(KE.Layer):
+    """Implements ROI Pooling on multiple levels of the feature pyramid.
+
+    Params:
+    - pool_shape: [pool_height, pool_width] of the output pooled regions. Usually [7, 7]
+
+    Inputs:
+    - boxes: [batch, num_boxes, (y1, x1, y2, x2)] in normalized
+             coordinates. Possibly padded with zeros if not enough
+             boxes to fill the array.
+    - image_meta: [batch, (meta data)] Image details. See compose_image_meta()
+    - feature_maps: List of feature maps from different levels of the pyramid.
+                    Each is [batch, height, width, channels]
+
+    Output:
+    Pooled regions in the shape: [batch, num_boxes, pool_height, pool_width, channels].
+    The width and height are those specific in the pool_shape in the layer
+    constructor.
+    """
+
+    def __init__(self, pool_shape, **kwargs):
+        super(PyramidROIAlign, self).__init__(**kwargs)
+        self.pool_shape = tuple(pool_shape)
+
+    def call(self, inputs):
+        # Crop boxes [batch, num_boxes, (y1, x1, y2, x2)] in normalized coords
+        boxes = inputs[0]
+
+        # Feature Maps. List of feature maps from different level of the
+        # feature pyramid. Each is [batch, height, width, channels]
+        feature_maps = inputs[1:]
+
+        # Assign each ROI to a level in the pyramid based on the ROI area.
+        y1, x1, y2, x2 = tf.split(boxes, 4, axis=2)
+        h = y2 - y1
+        w = x2 - x1
+        # Use shape of first image. Images in a batch must have the same size.
+        image_shape = Config.image_size[: 2]
+        # Equation 1 in the Feature Pyramid Networks paper. Account for
+        # the fact that our coordinates are normalized here.
+        # e.g. a 224x224 ROI (in pixels) maps to P4
+        image_area = tf.cast(image_shape[0] * image_shape[1], tf.float32)
+        roi_level = log2_graph(tf.sqrt(h * w) / (224.0 / tf.sqrt(image_area)))
+        roi_level = tf.minimum(5, tf.maximum(
+            2, 4 + tf.cast(tf.round(roi_level), tf.int32)))
+        roi_level = tf.squeeze(roi_level, 2)
+
+        # Loop through levels and apply ROI pooling to each. P2 to P5.
+        pooled = []
+        box_to_level = []
+        for i, level in enumerate(range(2, 6)):
+            ix = tf.where(tf.equal(roi_level, level))
+            level_boxes = tf.gather_nd(boxes, ix)
+
+            # Box indices for crop_and_resize.
+            box_indices = tf.cast(ix[:, 0], tf.int32)
+
+            # Keep track of which box is mapped to which level
+            box_to_level.append(ix)
+
+            # Stop gradient propogation to ROI proposals
+            level_boxes = tf.stop_gradient(level_boxes)
+            box_indices = tf.stop_gradient(box_indices)
+
+            # Crop and Resize
+            # From Mask R-CNN paper: "We sample four regular locations, so
+            # that we can evaluate either max or average pooling. In fact,
+            # interpolating only a single value at each bin center (without
+            # pooling) is nearly as effective."
+            #
+            # Here we use the simplified approach of a single value per bin,
+            # which is how it's done in tf.crop_and_resize()
+            # Result: [batch * num_boxes, pool_height, pool_width, channels]
+            pooled.append(tf.image.crop_and_resize(
+                feature_maps[i], level_boxes, box_indices, self.pool_shape,
+                method="bilinear"))
+
+        # Pack pooled features into one tensor
+        pooled = tf.concat(pooled, axis=0)
+
+        # Pack box_to_level mapping into one array and add another
+        # column representing the order of pooled boxes
+        box_to_level = tf.concat(box_to_level, axis=0)
+        box_range = tf.expand_dims(tf.range(tf.shape(box_to_level)[0]), 1)
+        box_to_level = tf.concat([tf.cast(box_to_level, tf.int32), box_range],
+                                 axis=1)
+
+        # Rearrange pooled features to match the order of the original boxes
+        # Sort box_to_level by batch then box index
+        # TF doesn't have a way to sort by two columns, so merge them and sort.
+        sorting_tensor = box_to_level[:, 0] * 100000 + box_to_level[:, 1]
+        ix = tf.nn.top_k(sorting_tensor, k=tf.shape(
+            box_to_level)[0]).indices[::-1]
+        ix = tf.gather(box_to_level[:, 2], ix)
+        pooled = tf.gather(pooled, ix)
+
+        # Re-add the batch dimension
+        shape = tf.concat([tf.shape(boxes)[:2], tf.shape(pooled)[1:]], axis=0)
+        pooled = tf.reshape(pooled, shape)
+        return pooled
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[0][:2] + self.pool_shape + (input_shape[2][-1], )
+
+
 # num_rois=21, pool_size=7, num_classes=4
-def fpn_classifiler(feature_map, rois, batch_size, num_rois, pool_size, num_classes):
-    x = RoiPoolingConvV2(7,num_rois,batch_size)([feature_map,rois]) # shape(batch_size,num_rois,pool_size,pool_size,4)
+def fpn_classifiler(feature_maps, rois, batch_size, num_rois, pool_size, num_classes):
+    #x = RoiPoolingConvV2(7,num_rois,batch_size)([feature_map,rois]) # shape(batch_size,num_rois,pool_size,pool_size,4)
+    x = PyramidROIAlign([pool_size, pool_size],
+                        name="roi_align_classifier")([rois]+feature_maps)
+    
     x = KL.TimeDistributed(KL.Conv2D(512, pool_size, padding="valid"),name="mrcnn_class_conv1")(x) # shape (batch_size,num_rois,1,1,512)
     x = KL.TimeDistributed(BatchNorm(axis=3),name="fpn_classifier_bn0")(x) # shape (batch_size,num_rois,1,1,512)
     x = KL.Activation('relu')(x) # shape (batch_size,num_rois,1,1,512)
@@ -768,26 +884,30 @@ class FasterRcnn():
         gt_bboxes = KL.Lambda(lambda x : x/imgae_scale)(input_bboxes)
 
 
-        feature_maps = resne_fpn_feature_extractor(input_image, config) # 特征提取  输出的shape(batch_size,8,8,1024)
+        feature_maps,mrcnn_feature_maps = resne_fpn_feature_extractor(input_image, config) # 特征提取  输出的shape(batch_size,8,8,1024)
         
         #构建
-        rpn = build_rpn_model(config.RPN_ANCHOR_STRIDE,len(config.ratios), config.TOP_DOWN_PYRAMID_SIZE)
+        rpn = build_rpn_model(1,len(config.ratios), config.TOP_DOWN_PYRAMID_SIZE)
 
         #存放特征金字塔特征
-        layer_outouts = []
+        layer_outputs = []
         for p in feature_maps:
-            layer_outouts.append(rpn(p))
+            layer_outputs.append(rpn(p))
 
-        
+        # e.g. [[a1, b1, c1], [a2, b2, c2]] => [[a1, a2], [b1, b2], [c1, c2]]
+        output_names = ["rpn_class_logits", "rpn_class", "rpn_bbox"]
+        outputs = list(zip(*layer_outputs))
+        outputs = [KL.Concatenate(axis=1, name=n)(list(o))
+                   for o, n in zip(outputs, output_names)]
 
-
+        rpn_prob, rpn_class, rpn_bbox = outputs
 
         #获取anchors 
-        anchors = utils.anchor_gen(featureMap_size=[8,8],ratios=config.ratios, #todo
+        anchors = utils.anchor_gen(featureMap_size=[32,32],ratios=config.ratios, #todo
                                 scales=config.scales,rpn_stride=config.rpn_stride,anchor_stride=config.anchor_stride) # shape(576,4)
 
         #proposal 提取边框
-        proposals = proposal(proposal_count=16,nms_thresh=0.7,anchors=anchors,batch_size=config.batch_size,config=config)([rpn_prob,rpn_bbox])
+        proposals = proposal(proposal_count=16,nms_thresh=0.7,anchors=anchors,batch_size=config.batch_size,config=config)([rpn_class,rpn_bbox])
         #shape(batch_size,16,4)   
         if mode == 'training':
             # 将proposal 和 真值 转化成  fpn的训练数据 delta
@@ -798,9 +918,11 @@ class FasterRcnn():
 
             #todo 查看输出shape
             #分类和回归  # (batch_size,num_rois, num_classes),(batch_size,num_rois, num_classes),(batch_size,num_rois, num_classes,4)
-            mrcnn_class_logits, mrcnn_class, mrcnn_bbox = fpn_classifiler(feature_map, denomrlaize_rois, 
+            mrcnn_class_logits, mrcnn_class, mrcnn_bbox = fpn_classifiler(mrcnn_feature_maps, denomrlaize_rois, 
                                                 batch_size=config.batch_size, num_rois=21, pool_size=7, num_classes=4)
             
+            print(input_rpn_match)
+            print(rpn_prob)
             #rpn_loss
             loss_rpn_match = KL.Lambda(lambda x:rpn_class_loss(*x),name='loss_rpn_match')([input_rpn_match,rpn_prob])
             loss_rpn_bbox = KL.Lambda(lambda x:rpn_bbox_loss(*x),name='loss_rpn_bbox')([input_rpn_box,input_rpn_match,rpn_bbox])
@@ -812,14 +934,14 @@ class FasterRcnn():
 
             if sub_net == 'rpn':
                 model = Model([input_image,input_bboxes,input_class_ids,input_active_ids,input_rpn_match,input_rpn_box],
-                [feature_map, rpn_class, rpn_prob, rpn_bbox, proposals, target_rois, denomrlaize_rois,target_class_ids,
+                [rpn_class, rpn_prob, rpn_bbox, proposals, target_rois, denomrlaize_rois,target_class_ids,
                 target_delta, target_bboxes, loss_rpn_match, loss_rpn_bbox])
             elif sub_net == 'all':
-                model = Model([input_image,input_bboxes,input_class_ids,input_active_ids,input_rpn_match,input_rpn_box],[feature_map, rpn_class, rpn_prob, rpn_bbox, proposals, target_rois, denomrlaize_rois,target_class_ids, target_delta, target_bboxes, mrcnn_class_logits, mrcnn_class, mrcnn_bbox, loss_rpn_match, loss_rpn_bbox, bbox_loss, class_loss])
+                model = Model([input_image,input_bboxes,input_class_ids,input_active_ids,input_rpn_match,input_rpn_box],[rpn_class, rpn_prob, rpn_bbox, proposals, target_rois, denomrlaize_rois,target_class_ids, target_delta, target_bboxes, mrcnn_class_logits, mrcnn_class, mrcnn_bbox, loss_rpn_match, loss_rpn_bbox, bbox_loss, class_loss])
             
         if mode == "inference":
             denomrlaize_proposals = KL.Lambda(lambda x:8.0*x, name="denormalized_proposals")(proposals)
-            mrcnn_class_logits, mrcnn_class, mrcnn_bbox = fpn_classifiler(feature_map, denomrlaize_proposals, 20, 16, 7, 4)
+            mrcnn_class_logits, mrcnn_class, mrcnn_bbox = fpn_classifiler(mrcnn_feature_maps, denomrlaize_proposals, 20, 16, 7, 4)
             detections = DetectionLayer(self.config)([proposals, mrcnn_class, mrcnn_bbox])
             
             model = Model([input_image],[detections])
@@ -873,14 +995,16 @@ class FasterRcnn():
 
 
 if __name__ == "__main__":
-    '''
+    
     from utils import shapeData as dataSet
     from config import Config
     config = Config()
-    dataset = dataSet([64,64], config=config)
+    dataset = dataSet([128,128], config=config)
 
-    model = FasterRcnn(mode="training", subnet="all", config=config)
-    model.loadWeights('./model_weights_rpn.h5')
+    model = FasterRcnn(mode="training", subnet="rpn", config=config)
+    #plot_model(model.keras_model, to_file='resnet.png')
+
+    #model.loadWeights('./model_weights_rpn.h5')
     
     def data_Gen(dataset, num_batch, batch_size, config):
         for _ in range(num_batch):
@@ -915,9 +1039,10 @@ if __name__ == "__main__":
 
     dataGen = data_Gen(dataset, 35000, 20, config)
     model.training(dataGen)
-    #model.saveWeights('model_weights_rpn.h5')
-    model.saveWeights('model_weights_all.h5')
+    model.saveWeights('model_weights_rpn.h5')
+    #model.saveWeights('model_weights_all.h5')
     
+
     '''
     from keras.utils import plot_model
     from config import Config 
@@ -930,18 +1055,25 @@ if __name__ == "__main__":
     rpn = build_rpn_model(config.anchor_stride,len(config.ratios), config.TOP_DOWN_PYRAMID_SIZE)
 
         #存放特征金字塔特征
-    layer_outouts = []
+    layer_outputs = []
     for p in feature_maps:
-        layer_outouts.append(rpn(p))
+        layer_outputs.append(rpn(p))
 
+    # e.g. [[a1, b1, c1], [a2, b2, c2]] => [[a1, a2], [b1, b2], [c1, c2]]
+    output_names = ["rpn_class_logits", "rpn_class", "rpn_bbox"]
+    outputs = list(zip(*layer_outputs))
+    outputs = [KL.Concatenate(axis=1, name=n)(list(o))
+                   for o, n in zip(outputs, output_names)]
+
+    rpn_class_logits, rpn_class, rpn_bbox = outputs
         
 
-    model = Model([input_tensor],layer_outouts)
+    model = Model([input_tensor],[rpn_class_logits, rpn_class, rpn_bbox])
 
     #model.summary()
 
     plot_model(model, to_file='resnet.png')
-
+    '''
 
 
     
